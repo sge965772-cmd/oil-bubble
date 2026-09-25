@@ -24,6 +24,8 @@ typedef struct {
 
 typedef struct {
   bool valid;
+  int lower_sample_count;
+  int upper_sample_count;
   double radius;
   double width;
   double gap;

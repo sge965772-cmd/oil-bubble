@@ -46,6 +46,18 @@ typedef struct {
   double acceleration;
 } CapillaryAnchorCommand;
 
+typedef struct {
+  CapillaryAnchorStatus status;
+  double integral_error;
+  double commanded_acceleration;
+  double release_time;
+  double release_gap;
+  double last_reaction_force;
+  double last_power;
+  double cumulative_work;
+  unsigned long saturation_count;
+} CapillaryAnchorRestartSnapshot;
+
 static inline CapillaryAnchorConfig capillary_anchor_config (
   double release_gap,
   double proportional_gain,
@@ -85,6 +97,39 @@ static inline CapillaryAnchorState capillary_anchor_released_state (void)
   CapillaryAnchorState state = capillary_anchor_initial_state();
   state.status = CAPILLARY_ANCHOR_RELEASED;
   return state;
+}
+
+static inline bool capillary_anchor_restore (
+  CapillaryAnchorState * state,
+  CapillaryAnchorRestartSnapshot snapshot,
+  double restart_time)
+{
+  if (!state || !isfinite(restart_time) || restart_time < 0. ||
+      !isfinite(snapshot.integral_error) ||
+      !isfinite(snapshot.commanded_acceleration) ||
+      !isfinite(snapshot.last_reaction_force) ||
+      !isfinite(snapshot.last_power) || !isfinite(snapshot.cumulative_work))
+    return false;
+  if (snapshot.status == CAPILLARY_ANCHOR_RELEASED &&
+      (!isfinite(snapshot.release_time) ||
+       !isfinite(snapshot.release_gap) || snapshot.release_gap <= 0. ||
+       snapshot.release_time > restart_time))
+    return false;
+  if (snapshot.status != CAPILLARY_ANCHOR_HOLDING &&
+      snapshot.status != CAPILLARY_ANCHOR_RELEASED)
+    return false;
+  state->status = snapshot.status;
+  state->integral_error = snapshot.integral_error;
+  state->commanded_acceleration = snapshot.commanded_acceleration;
+  state->release_time = snapshot.status == CAPILLARY_ANCHOR_RELEASED ?
+    snapshot.release_time : NAN;
+  state->release_gap = snapshot.status == CAPILLARY_ANCHOR_RELEASED ?
+    snapshot.release_gap : NAN;
+  state->last_reaction_force = snapshot.last_reaction_force;
+  state->last_power = snapshot.last_power;
+  state->cumulative_work = snapshot.cumulative_work;
+  state->saturation_count = snapshot.saturation_count;
+  return true;
 }
 
 static inline double capillary_anchor_clamp (

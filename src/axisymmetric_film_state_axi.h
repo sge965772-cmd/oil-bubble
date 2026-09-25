@@ -7,6 +7,7 @@
 
 #include "axisymmetric_film_samples.h"
 #include "axisymmetric_film_state.h"
+#include "axisymmetric_force_audit_policy.h"
 #include "contact_amr_policy.h"
 
 /* This adapter owns the Basilisk-specific support integration.  Include it
@@ -51,8 +52,6 @@ enum {
 
 #define AXISYMMETRIC_FILM_STATE_AXI_IDENTITY_BOUND_TOLERANCE \
   (1024.*DBL_EPSILON)
-#define AXISYMMETRIC_FILM_STATE_AXI_FORCE_AUDIT_RELATIVE_TOLERANCE \
-  (8192.*DBL_EPSILON)
 #define AXISYMMETRIC_FILM_STATE_AXI_RADIAL_MOMENT_RELATIVE_TOLERANCE .02
 
 typedef struct {
@@ -704,17 +703,18 @@ axisymmetric_film_state_apply_axi (
   const double requested_force_scale = max(DBL_MIN,
     max(fabs(ledger.requested_lower_axial_force),
         fabs(ledger.requested_upper_axial_force)));
-  ledger.force_audit_tolerance =
-    AXISYMMETRIC_FILM_STATE_AXI_FORCE_AUDIT_RELATIVE_TOLERANCE*
-    requested_force_scale;
-  ledger.force_audit_nonfinite = nonfinite_actual_faces > 0 ||
-    !isfinite(ledger.measured_lower_axial_force) ||
-    !isfinite(ledger.measured_upper_axial_force) ||
-    !isfinite(ledger.lower_force_residual) ||
-    !isfinite(ledger.upper_force_residual);
-  ledger.force_audit_failed = ledger.force_audit_nonfinite ||
-    fabs(ledger.lower_force_residual) > ledger.force_audit_tolerance ||
-    fabs(ledger.upper_force_residual) > ledger.force_audit_tolerance;
+  const AxisymmetricForceAudit force_audit =
+    axisymmetric_force_audit_evaluate(
+      ledger.requested_lower_axial_force,
+      ledger.requested_upper_axial_force,
+      ledger.lower_force_residual,
+      ledger.upper_force_residual,
+      ledger.application_force_error_l1,
+      ledger.swamped_increment_faces,
+      nonfinite_actual_faces > 0);
+  ledger.force_audit_tolerance = force_audit.tolerance;
+  ledger.force_audit_nonfinite = force_audit.nonfinite;
+  ledger.force_audit_failed = force_audit.failed;
   if (ledger.force_audit_failed) {
     foreach_face() {
       acceleration_field.x[] = acceleration_before.x[];

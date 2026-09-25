@@ -129,6 +129,9 @@ static inline void dual_compound_update_properties (void)
     dual_compound_rho[] = cm[]*(density > 1.e-12 ? density : 1.e-12);
   }
   boundary({dual_compound_rho});
+#ifdef DUAL_COMPOUND_PROPERTIES_EXTENSION
+  DUAL_COMPOUND_PROPERTIES_EXTENSION();
+#endif
 }
 
 event properties (i++)

@@ -9,6 +9,37 @@
 
 #include "grid/quadtree.h"
 #include "axi.h"
+
+#ifndef COLLISION_WRITE_COMMON_STATE_CHECKPOINT
+# define COLLISION_WRITE_COMMON_STATE_CHECKPOINT 0
+#endif
+#ifndef COMMON_STATE_CHECKPOINT_PATH
+# define COMMON_STATE_CHECKPOINT_PATH "state/common-state.dump"
+#endif
+
+/*
+ * Basilisk executes inherited events in reverse declaration order.  Declaring
+ * this thin hook before centered.h therefore places it after both the user
+ * restore/insertion event and centered.h's face-velocity/property setup.
+ */
+#if INITIAL_UPPER_TRANSLATION_CONDITIONING && !COLLISION_FULL_STATE_RESTART
+static void collision_condition_initial_upper_translation (void);
+#if COLLISION_WRITE_COMMON_STATE_CHECKPOINT
+static bool collision_write_common_state_checkpoint (
+  double checkpoint_time, int checkpoint_iteration);
+#endif
+
+event init (i = 0, last)
+{
+  collision_condition_initial_upper_translation();
+#if COLLISION_WRITE_COMMON_STATE_CHECKPOINT
+  if (!collision_write_common_state_checkpoint(t, i))
+    exit(2);
+  return 1;
+#endif
+}
+#endif
+
 #include "navier-stokes/centered.h"
 #include "fractions.h"
 #include "axisymmetric_numerical_policy.h"
@@ -31,6 +62,7 @@
 #include "axisymmetric_velocity_audit.h"
 #include "capillary_anchor_controller.h"
 #include "capillary_anchor_axi.h"
+#include "axisymmetric_initial_velocity_conditioner_axi.h"
 #include <float.h>
 #include <string.h>
 
@@ -115,6 +147,24 @@
 #ifndef INITIAL_GAP_TOLERANCE_CELLS
 # define INITIAL_GAP_TOLERANCE_CELLS 0.5
 #endif
+#ifndef INITIAL_UPPER_TRANSLATION_CONDITIONING
+# define INITIAL_UPPER_TRANSLATION_CONDITIONING 0
+#endif
+#ifndef INITIAL_CONDITIONING_TRANSITION_CELLS
+# define INITIAL_CONDITIONING_TRANSITION_CELLS 8.
+#endif
+#ifndef INITIAL_CONDITIONING_PROJECTION_TOLERANCE
+# define INITIAL_CONDITIONING_PROJECTION_TOLERANCE 1.e-10
+#endif
+#ifndef INITIAL_CONDITIONING_PROJECTION_NITERMAX
+# define INITIAL_CONDITIONING_PROJECTION_NITERMAX 2000
+#endif
+#ifndef INITIAL_CONDITIONING_COM_TOLERANCE
+# define INITIAL_CONDITIONING_COM_TOLERANCE 1.e-7
+#endif
+#ifndef INITIAL_CONDITIONING_RELATIVE_DIVERGENCE_TOLERANCE
+# define INITIAL_CONDITIONING_RELATIVE_DIVERGENCE_TOLERANCE 1.e-9
+#endif
 #ifndef LOG_GAP_ALIGNMENT_SEARCH
 # define LOG_GAP_ALIGNMENT_SEARCH 0
 #endif
@@ -145,6 +195,18 @@
 #ifndef COLLISION_FULL_STATE_RESTART
 # define COLLISION_FULL_STATE_RESTART 0
 #endif
+#ifndef COLLISION_COMMON_STATE_RESTART
+# define COLLISION_COMMON_STATE_RESTART 0
+#endif
+#ifndef COLLISION_COMMON_STATE_IDENTITY_ONLY
+# define COLLISION_COMMON_STATE_IDENTITY_ONLY 0
+#endif
+#if COLLISION_COMMON_STATE_RESTART && !COLLISION_FULL_STATE_RESTART
+# error "common-state restart requires full native-state restore"
+#endif
+#if COLLISION_COMMON_STATE_IDENTITY_ONLY && !COLLISION_COMMON_STATE_RESTART
+# error "common-state identity mode requires common-state restart"
+#endif
 #ifndef RESTART_FIELD_AUDIT
 # define RESTART_FIELD_AUDIT 0
 #endif
@@ -170,6 +232,42 @@
 # endif
 # ifndef RESTART_INITIAL_UPPER_OIL_VOLUME
 #  error "full-state restart requires RESTART_INITIAL_UPPER_OIL_VOLUME"
+# endif
+# ifndef RESTART_ANCHOR_STATUS
+#  error "full-state restart requires RESTART_ANCHOR_STATUS"
+# endif
+# ifndef RESTART_ANCHOR_INTEGRAL_ERROR
+#  error "full-state restart requires RESTART_ANCHOR_INTEGRAL_ERROR"
+# endif
+# ifndef RESTART_ANCHOR_COMMANDED_ACCELERATION
+#  error "full-state restart requires RESTART_ANCHOR_COMMANDED_ACCELERATION"
+# endif
+# ifndef RESTART_ANCHOR_LAST_REACTION_FORCE
+#  error "full-state restart requires RESTART_ANCHOR_LAST_REACTION_FORCE"
+# endif
+# ifndef RESTART_ANCHOR_LAST_POWER
+#  error "full-state restart requires RESTART_ANCHOR_LAST_POWER"
+# endif
+# ifndef RESTART_ANCHOR_SATURATION_COUNT
+#  error "full-state restart requires RESTART_ANCHOR_SATURATION_COUNT"
+# endif
+# ifndef RESTART_ANCHOR_RELEASE_THRESHOLD
+#  error "full-state restart requires RESTART_ANCHOR_RELEASE_THRESHOLD"
+# endif
+# ifndef RESTART_ANCHOR_PROPORTIONAL_GAIN
+#  error "full-state restart requires RESTART_ANCHOR_PROPORTIONAL_GAIN"
+# endif
+# ifndef RESTART_ANCHOR_INTEGRAL_GAIN
+#  error "full-state restart requires RESTART_ANCHOR_INTEGRAL_GAIN"
+# endif
+# ifndef RESTART_ANCHOR_ACCELERATION_LIMIT
+#  error "full-state restart requires RESTART_ANCHOR_ACCELERATION_LIMIT"
+# endif
+# ifndef RESTART_ANCHOR_REQUIRE_APPROACH
+#  error "full-state restart requires RESTART_ANCHOR_REQUIRE_APPROACH"
+# endif
+# ifndef RESTART_ANCHOR_FEEDFORWARD_ACCELERATION
+#  error "full-state restart requires RESTART_ANCHOR_FEEDFORWARD_ACCELERATION"
 # endif
 # ifndef RESTART_RELEASE_TIME
 #  error "full-state restart requires RESTART_RELEASE_TIME"
@@ -234,6 +332,9 @@ static double last_film_primitive_time = NAN;
 static bool film_state_failed;
 static long latest_contact_amr_forced_cells;
 static double estimated_buoyancy_force;
+#if INITIAL_UPPER_TRANSLATION_CONDITIONING && !COLLISION_FULL_STATE_RESTART
+static AxisymmetricInitialVelocityAudit initial_velocity_conditioning_audit;
+#endif
 #if COLLISION_FULL_STATE_RESTART
 static bool restart_pressure_boundary_initialized;
 static bool restart_projection_input_failed;
@@ -250,6 +351,15 @@ static inline bool collision_terminal_event_time (double current_time,
   const double tolerance = 128.*DBL_EPSILON*max(1., fabs(end_time));
   return current_time >= end_time - tolerance;
 }
+
+#ifdef COLLISION_TRACTION_EXTENSION_HEADER
+# define COLLISION_TRACTION_STRINGIFY_INNER(value) #value
+# define COLLISION_TRACTION_STRINGIFY(value) \
+    COLLISION_TRACTION_STRINGIFY_INNER(value)
+# include COLLISION_TRACTION_STRINGIFY(COLLISION_TRACTION_EXTENSION_HEADER)
+# undef COLLISION_TRACTION_STRINGIFY
+# undef COLLISION_TRACTION_STRINGIFY_INNER
+#endif
 
 static void append_collision_diagnostics (double output_time,
                                           int output_iteration);
@@ -693,6 +803,17 @@ event init (i = 0)
     fprintf(stderr, "cannot read restart dump clock: %s\n", restore_path);
     exit(5);
   }
+#if COLLISION_COMMON_STATE_RESTART
+  if (restart_dump_time != 0. || restart_dump_iteration != 0 ||
+      (double)RESTART_SOURCE_TIME != 0.) {
+    fprintf(stderr,
+      "common-state restart requires t=0/i=0: dump_t=%.17g dump_i=%d "
+      "source_t=%.17g\n",
+      restart_dump_time, restart_dump_iteration,
+      (double)RESTART_SOURCE_TIME);
+    exit(5);
+  }
+#endif
 #endif
   if (!restore(file = restore_path)) {
     fprintf(stderr, "restore failed: %s\n", restore_path);
@@ -712,10 +833,41 @@ event init (i = 0)
   initial_oil_volumes[0] = (double)RESTART_INITIAL_LOWER_OIL_VOLUME;
   initial_gas_volumes[1] = (double)RESTART_INITIAL_UPPER_GAS_VOLUME;
   initial_oil_volumes[1] = (double)RESTART_INITIAL_UPPER_OIL_VOLUME;
-  anchor_state = capillary_anchor_released_state();
-  anchor_state.release_time = (double)RESTART_RELEASE_TIME;
-  anchor_state.release_gap = (double)RESTART_RELEASE_GAP;
-  anchor_state.cumulative_work = (double)RESTART_CONSTRAINT_WORK;
+  const double restart_length_unit = 1. [1];
+  const double restart_time_unit = 1. [0,1];
+  const double restart_acceleration_unit = 1. [1,-2];
+  const double restart_force_unit = 1. [1,-2,1];
+  const double restart_power_unit = 1. [2,-3,1];
+  const double restart_work_unit = 1. [2,-2,1];
+  CapillaryAnchorRestartSnapshot anchor_snapshot;
+  anchor_snapshot.status = (int)RESTART_ANCHOR_STATUS;
+  anchor_snapshot.integral_error =
+    (double)RESTART_ANCHOR_INTEGRAL_ERROR*restart_length_unit;
+  anchor_snapshot.commanded_acceleration =
+    (double)RESTART_ANCHOR_COMMANDED_ACCELERATION*
+      restart_acceleration_unit;
+  anchor_snapshot.release_time =
+    (double)RESTART_RELEASE_TIME*restart_time_unit;
+  anchor_snapshot.release_gap =
+    (double)RESTART_RELEASE_GAP*restart_length_unit;
+  anchor_snapshot.last_reaction_force =
+    (double)RESTART_ANCHOR_LAST_REACTION_FORCE*restart_force_unit;
+  anchor_snapshot.last_power =
+    (double)RESTART_ANCHOR_LAST_POWER*restart_power_unit;
+  anchor_snapshot.cumulative_work =
+    (double)RESTART_CONSTRAINT_WORK*restart_work_unit;
+  anchor_snapshot.saturation_count =
+    (unsigned long)RESTART_ANCHOR_SATURATION_COUNT;
+  if (!capillary_anchor_restore(
+        &anchor_state, anchor_snapshot, restart_dump_time)) {
+    fprintf(stderr, "invalid capillary anchor restart state\n");
+    exit(5);
+  }
+  latest_anchor_command.active =
+    anchor_state.status == CAPILLARY_ANCHOR_HOLDING;
+  latest_anchor_command.acceleration =
+    latest_anchor_command.active ? anchor_state.commanded_acceleration : 0.;
+  latest_anchor_load.reaction_force = anchor_state.last_reaction_force;
 #if ENABLE_STATEFUL_FILM
   film_restart_restored = axisymmetric_film_state_restore(&film_state);
   film_restart_continuity_error = fabs(restart_dump_time -
@@ -836,9 +988,16 @@ event init (i = 0)
   estimated_buoyancy_force =
     (rho_water*latest_anchor_load.support_volume -
      latest_anchor_load.effective_mass)*(double)GRAVITY_MAGNITUDE;
-  anchor_config.feedforward_acceleration =
-    -estimated_buoyancy_force/
-    max(latest_anchor_load.effective_mass, 1.e-300);
+#if COLLISION_FULL_STATE_RESTART
+  if (anchor_state.status == CAPILLARY_ANCHOR_HOLDING)
+    anchor_config.feedforward_acceleration =
+      (double)RESTART_ANCHOR_FEEDFORWARD_ACCELERATION*
+      restart_acceleration_unit;
+  else
+#endif
+    anchor_config.feedforward_acceleration =
+      -estimated_buoyancy_force/
+      max(latest_anchor_load.effective_mass, 1.e-300);
 
   if (pid() == 0) {
     CollisionState initialized = initial;
@@ -966,12 +1125,200 @@ event init (i = 0)
 #endif
   }
 #if COLLISION_FULL_STATE_RESTART
+# ifdef COLLISION_TRACTION_EXTENSION_HEADER
+#  if !COLLISION_COMMON_STATE_RESTART
+  if (!collision_traction_extension_restore(
+        restore_path, restart_dump_time, restart_dump_iteration)) {
+    fprintf(stderr, "traction extension restart failed\n");
+    exit(6);
+  }
+#  endif
+# endif
   append_collision_diagnostics(restart_dump_time, restart_dump_iteration);
 # if ENABLE_STATEFUL_FILM
   append_film_state_primitive(restart_dump_time, restart_dump_iteration);
 # endif
+# if COLLISION_COMMON_STATE_RESTART
+  if (pid() == 0)
+    fprintf(stderr,
+      "# COLLISION_COMMON_STATE_RESTART source=%s dump_t=%.17g "
+      "dump_i=%d model_state=uninitialized\n",
+      restore_path, restart_dump_time, restart_dump_iteration);
+  if (COLLISION_COMMON_STATE_IDENTITY_ONLY)
+    return 1;
+# endif
 #endif
 }
+
+#if INITIAL_UPPER_TRANSLATION_CONDITIONING && !COLLISION_FULL_STATE_RESTART
+static void collision_condition_initial_upper_translation (void)
+{
+  CollisionState before = measure_collision_state();
+  double lower_core_radius = 0., upper_core_radius = 0.;
+  foreach(reduction(max:lower_core_radius)
+          reduction(max:upper_core_radius)) {
+    double half_diagonal = sqrt(2.)*Delta/2.;
+    if (lower_envelope_fraction[] > 1.e-12)
+      lower_core_radius = max(lower_core_radius,
+        sqrt(sq(x - before.centers[0]) + sq(y)) + half_diagonal);
+    if (upper_envelope_fraction[] > 1.e-12)
+      upper_core_radius = max(upper_core_radius,
+        sqrt(sq(x - before.centers[1]) + sq(y)) + half_diagonal);
+  }
+  const double finest_delta = L0/(1 << MAXLEVEL);
+  const double transition_width =
+    (double)INITIAL_CONDITIONING_TRANSITION_CELLS*finest_delta;
+  boundary((scalar *){uf, dual_compound_alpha});
+  initial_velocity_conditioning_audit =
+    axisymmetric_condition_upper_translation(
+      uf, u, lower_envelope_fraction, upper_envelope_fraction,
+      dual_compound_alpha, before.centers[0], before.centers[1],
+      lower_core_radius, upper_core_radius, transition_width,
+      (double)INITIAL_CONDITIONING_PROJECTION_TOLERANCE,
+      (int)INITIAL_CONDITIONING_PROJECTION_NITERMAX);
+  CollisionState after = measure_collision_state();
+  double lower_error = fabs(
+    after.center_velocities[0] - before.center_velocities[0]);
+  double upper_error = fabs(after.center_velocities[1]);
+  bool conditioning_valid = initial_velocity_conditioning_audit.valid &&
+    lower_error <= (double)INITIAL_CONDITIONING_COM_TOLERANCE &&
+    upper_error <= (double)INITIAL_CONDITIONING_COM_TOLERANCE &&
+    initial_velocity_conditioning_audit.relative_metric_divergence <=
+      (double)INITIAL_CONDITIONING_RELATIVE_DIVERGENCE_TOLERANCE;
+
+  if (pid() == 0) {
+    FILE * fp = fopen("data/initial_velocity_conditioning.dat", "w");
+    if (!fp) {
+      perror("data/initial_velocity_conditioning.dat");
+      exit(2);
+    }
+    fprintf(fp,
+      "# valid original_lower_u original_upper_u projected_lower_u "
+      "projected_upper_u final_lower_u final_upper_u lower_coefficient "
+      "upper_coefficient response_determinant max_metric_divergence "
+      "max_velocity_gradient_scale relative_metric_divergence "
+      "baseline_projection_iterations baseline_projection_residual "
+      "lower_basis_projection_iterations lower_basis_projection_residual "
+      "upper_basis_projection_iterations upper_basis_projection_residual "
+      "lower_core_radius upper_core_radius transition_width\n"
+      "%d %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g %.17g "
+      "%.17g %.17g %.17g %d %.17g %d %.17g %d %.17g %.17g %.17g "
+      "%.17g\n",
+      conditioning_valid,
+      initial_velocity_conditioning_audit.original_lower_velocity,
+      initial_velocity_conditioning_audit.original_upper_velocity,
+      initial_velocity_conditioning_audit.projected_lower_velocity,
+      initial_velocity_conditioning_audit.projected_upper_velocity,
+      initial_velocity_conditioning_audit.final_lower_velocity,
+      initial_velocity_conditioning_audit.final_upper_velocity,
+      initial_velocity_conditioning_audit.lower_coefficient,
+      initial_velocity_conditioning_audit.upper_coefficient,
+      initial_velocity_conditioning_audit.response_determinant,
+      initial_velocity_conditioning_audit.maximum_metric_divergence,
+      initial_velocity_conditioning_audit.maximum_velocity_gradient_scale,
+      initial_velocity_conditioning_audit.relative_metric_divergence,
+      initial_velocity_conditioning_audit.baseline_projection.i,
+      initial_velocity_conditioning_audit.baseline_projection.resa,
+      initial_velocity_conditioning_audit.lower_basis_projection.i,
+      initial_velocity_conditioning_audit.lower_basis_projection.resa,
+      initial_velocity_conditioning_audit.upper_basis_projection.i,
+      initial_velocity_conditioning_audit.upper_basis_projection.resa,
+      lower_core_radius, upper_core_radius, transition_width);
+    fclose(fp);
+
+    fp = fopen("data/initialization_audit.dat", "w");
+    if (!fp) {
+      perror("data/initialization_audit.dat");
+      exit(2);
+    }
+    fprintf(fp,
+      "# profile_mode requested_gap plic_gap plic_valid lower_center "
+      "upper_center lower_u upper_u envelope_overlap gas_overlap "
+      "nesting overfill\n"
+      "%d %.17g %.17g %d %.17g %.17g %.17g %.17g %.17g %.17g "
+      "%.17g %.17g\n",
+      (int)UPPER_PROFILE_MODE, (double)INITIAL_GAP,
+      latest_contact_geometry.gap, latest_contact_geometry.valid,
+      after.centers[0], after.centers[1],
+      after.center_velocities[0], after.center_velocities[1],
+      after.envelope_overlap_volume, after.gas_overlap_volume,
+      after.nesting_volume, after.overfill_volume);
+    fclose(fp);
+  }
+  if (!conditioning_valid) {
+    fprintf(stderr,
+      "initial upper translation conditioning failed: lower_error=%.17g "
+      "upper_error=%.17g divergence=%.17g relative_divergence=%.17g "
+      "response_det=%.17g\n",
+      lower_error, upper_error,
+      initial_velocity_conditioning_audit.maximum_metric_divergence,
+      initial_velocity_conditioning_audit.relative_metric_divergence,
+      initial_velocity_conditioning_audit.response_determinant);
+    exit(2);
+  }
+}
+
+#if COLLISION_WRITE_COMMON_STATE_CHECKPOINT
+static bool collision_write_common_state_checkpoint (
+  double checkpoint_time, int checkpoint_iteration)
+{
+#ifdef COLLISION_TRACTION_EXTENSION_HAS_COMMON_STATE_PREPARE
+  collision_traction_extension_prepare_common_state_checkpoint();
+#endif
+  boundary((scalar *){
+    lower_gas_fraction, lower_envelope_fraction,
+    upper_gas_fraction, upper_envelope_fraction, u, p, pf
+  });
+  dump(file = COMMON_STATE_CHECKPOINT_PATH);
+
+  CollisionState state = measure_collision_state();
+  AxisymmetricContactGeometry contact =
+    measure_axisymmetric_contact_geometry((double)CONTACT_SUPPORT_HALF_WIDTH);
+  int success = 1;
+  if (pid() == 0) {
+    FILE * output = fopen("data/common_state_checkpoint.dat", "w");
+    if (!output)
+      success = 0;
+    else {
+      fprintf(output,
+        "# t i cells lower_gas lower_oil upper_gas upper_oil "
+        "lower_center upper_center lower_u upper_u outer_gap plic_gap "
+        "plic_valid nesting envelope_overlap gas_overlap overfill "
+        "anchor_status anchor_integral anchor_command release_time "
+        "release_gap reaction_force reaction_power constraint_work "
+        "saturation_count release_threshold proportional_gain "
+        "integral_gain acceleration_limit feedforward require_approach\n");
+      fprintf(output,
+        "%.17g %d %ld %.17g %.17g %.17g %.17g %.17g %.17g %.17g "
+        "%.17g %.17g %.17g %d %.17g %.17g %.17g %.17g %d %.17g "
+        "%.17g %.17g %.17g %.17g %.17g %.17g %lu %.17g %.17g "
+        "%.17g %.17g %.17g %d\n",
+        checkpoint_time, checkpoint_iteration, grid->tn,
+        state.gas_volumes[0], state.oil_volumes[0],
+        state.gas_volumes[1], state.oil_volumes[1],
+        state.centers[0], state.centers[1],
+        state.center_velocities[0], state.center_velocities[1],
+        state.outer_gap, contact.gap, contact.valid,
+        state.nesting_volume, state.envelope_overlap_volume,
+        state.gas_overlap_volume, state.overfill_volume,
+        anchor_state.status, anchor_state.integral_error,
+        anchor_state.commanded_acceleration, anchor_state.release_time,
+        anchor_state.release_gap, anchor_state.last_reaction_force,
+        anchor_state.last_power, anchor_state.cumulative_work,
+        anchor_state.saturation_count, anchor_config.release_gap,
+        anchor_config.proportional_gain, anchor_config.integral_gain,
+        anchor_config.acceleration_limit, anchor_config.feedforward_acceleration,
+        anchor_config.require_approach);
+      success = fclose(output) == 0;
+    }
+  }
+#if _MPI
+  MPI_Bcast(&success, 1, MPI_INT, 0, MPI_COMM_WORLD);
+#endif
+  return success;
+}
+#endif
+#endif
 
 event stability (i++, last)
 {
@@ -1139,16 +1486,26 @@ event acceleration (i++)
         collision_abort_film_transaction(&state_before_update);
   }
 #endif
-}
-
-event projection (i++)
-{
+#ifdef COLLISION_TRACTION_EXTENSION_HEADER
 #if COLLISION_FULL_STATE_RESTART
+  // A restored MPI tree has valid pressure cells but stale process ghosts.
+  // Track A samples p before the normal projection event can refresh them.
   if (!restart_pressure_boundary_initialized) {
     p.dirty = pf.dirty = true;
     boundary((scalar *){p, pf});
     restart_pressure_boundary_initialized = true;
   }
+#endif
+  if (!collision_traction_extension_apply(acceleration_field, t, dt, i)) {
+    collision_traction_extension_report_failure(t, dt, i);
+    exit(6);
+  }
+#endif
+}
+
+event projection (i++)
+{
+#if COLLISION_FULL_STATE_RESTART
 #if RESTART_FIELD_AUDIT
   if (restart_projection_audit_count < 2) {
     long invalid_faces = 0, invalid_cells = 0;
@@ -1541,6 +1898,7 @@ static void append_collision_diagnostics (double output_time,
   }
 }
 
+#if !COLLISION_WRITE_COMMON_STATE_CHECKPOINT
 #if COLLISION_FULL_STATE_RESTART
 event diagnostics (t = RESTART_SOURCE_TIME;
                    t <= END_TIME; t += OUTPUT_INTERVAL)
@@ -1598,10 +1956,24 @@ event snapshots (t = 0.; t <= END_TIME; t += DUMP_INTERVAL)
   char path[128];
   sprintf(path, "dumps/anchor-%09.6f", t);
   dump(file = path);
+#ifdef COLLISION_TRACTION_EXTENSION_HEADER
+  if (!collision_traction_extension_checkpoint(path, t, i))
+    exit(6);
+#endif
 #if ENABLE_STATEFUL_FILM
   append_film_state_primitive(t, i);
 #endif
 }
+#endif // !COLLISION_WRITE_COMMON_STATE_CHECKPOINT
+
+#ifdef COLLISION_READ_ONLY_OBSERVER_HEADER
+# define COLLISION_OBSERVER_STRINGIFY_INNER(value) #value
+# define COLLISION_OBSERVER_STRINGIFY(value) \
+    COLLISION_OBSERVER_STRINGIFY_INNER(value)
+# include COLLISION_OBSERVER_STRINGIFY(COLLISION_READ_ONLY_OBSERVER_HEADER)
+# undef COLLISION_OBSERVER_STRINGIFY
+# undef COLLISION_OBSERVER_STRINGIFY_INNER
+#endif
 
 event adapt (i++)
 {
@@ -1634,8 +2006,15 @@ event adapt (i++)
 event finish (t = END_TIME)
 {
   dump(file = "dumps/final");
+#ifdef COLLISION_TRACTION_EXTENSION_HEADER
+  if (!collision_traction_extension_checkpoint("dumps/final", t, i))
+    exit(6);
+#endif
 #if ENABLE_STATEFUL_FILM
   append_film_state_primitive(t, i);
+#endif
+#ifdef COLLISION_TRACTION_EXTENSION_HEADER
+  collision_traction_extension_finish(t, i);
 #endif
   if (pid() == 0)
     fprintf(stderr,

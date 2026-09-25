@@ -15,7 +15,10 @@ typedef enum {
   NESTED_PLIC_NEIGHBOR_FALLBACK = 6,
   NESTED_PLIC_PAIRED_NEIGHBOR_CONSENSUS = 7,
   NESTED_PLIC_NEGLIGIBLE_ENDPOINT_FALLBACK = 8,
-  NESTED_PLIC_CENTER_PAIRED_NEIGHBOR_CONSENSUS = 9
+  NESTED_PLIC_CENTER_PAIRED_NEIGHBOR_CONSENSUS = 9,
+  NESTED_PLIC_ENDPOINT_GRADIENT_FALLBACK = 10,
+  NESTED_PLIC_ENDPOINT_CENTER_BLEND = 11,
+  NESTED_PLIC_COINCIDENT_INVENTORY_BLEND = 12
 } NestedPlicReason;
 
 #define NESTED_PLIC_NEIGHBOR_COUNT 4
@@ -86,6 +89,9 @@ typedef struct {
 # define NESTED_PLIC_CENTER_PAIRED_COSINE_MIN \
   NESTED_PLIC_NEIGHBOR_CONSENSUS_COSINE_MIN
 #endif
+#ifndef NESTED_PLIC_ENDPOINT_GRADIENT_DOMINANCE_RATIO
+# define NESTED_PLIC_ENDPOINT_GRADIENT_DOMINANCE_RATIO 2.
+#endif
 
 /*
  * Cuts at the same pure endpoint within roundoff, and two unresolved cuts at
@@ -116,6 +122,74 @@ static inline bool nested_plic_requires_common_normal (
     inner_quality < (double)NESTED_PLIC_NEIGHBOR_QUALITY_MIN &&
     outer_quality < (double)NESTED_PLIC_NEIGHBOR_QUALITY_MIN;
   return !(both_empty || both_full || separated_unresolved_cuts);
+}
+
+/*
+ * Return true when the original inner PLIC half-plane is already a subset of
+ * the original outer PLIC half-plane inside the unit cell.  In that case every
+ * swept subregion also preserves inner <= outer, so forcing one common normal
+ * would discard a valid pair of spatially separated cuts.  Non-finite or
+ * degenerate inputs fail closed and continue through common-normal recovery.
+ */
+static inline bool nested_plic_independent_cuts_are_nested (
+  double inner_x, double inner_y, double inner_alpha,
+  double outer_x, double outer_y, double outer_alpha)
+{
+  const double values[6] = {
+    inner_x, inner_y, inner_alpha,
+    outer_x, outer_y, outer_alpha
+  };
+  for (int index = 0; index < 6; index++)
+    if (!isfinite(values[index]))
+      return false;
+  const double inner_norm = fabs(inner_x) + fabs(inner_y);
+  const double outer_norm = fabs(outer_x) + fabs(outer_y);
+  if (inner_norm <= 64.*DBL_EPSILON ||
+      outer_norm <= 64.*DBL_EPSILON)
+    return false;
+
+  const double tolerance = 256.*DBL_EPSILON*(
+    1. + inner_norm + outer_norm +
+    fabs(inner_alpha) + fabs(outer_alpha));
+  const double corners[4][2] = {
+    {-0.5, -0.5}, {0.5, -0.5}, {0.5, 0.5}, {-0.5, 0.5}
+  };
+  const int edge_start[4] = {0, 1, 2, 3};
+  const int edge_end[4] = {1, 2, 3, 0};
+  int candidate_count = 0;
+
+  for (int corner = 0; corner < 4; corner++) {
+    const double x = corners[corner][0], y = corners[corner][1];
+    const double inner_signed = inner_x*x + inner_y*y - inner_alpha;
+    if (inner_signed <= tolerance) {
+      candidate_count++;
+      if (outer_x*x + outer_y*y - outer_alpha > tolerance)
+        return false;
+    }
+  }
+
+  for (int edge = 0; edge < 4; edge++) {
+    const double x0 = corners[edge_start[edge]][0];
+    const double y0 = corners[edge_start[edge]][1];
+    const double x1 = corners[edge_end[edge]][0];
+    const double y1 = corners[edge_end[edge]][1];
+    const double signed0 = inner_x*x0 + inner_y*y0 - inner_alpha;
+    const double signed1 = inner_x*x1 + inner_y*y1 - inner_alpha;
+    const double denominator = signed0 - signed1;
+    if (fabs(denominator) <= tolerance ||
+        !((signed0 <= tolerance && signed1 >= -tolerance) ||
+          (signed1 <= tolerance && signed0 >= -tolerance)))
+      continue;
+    const double position = signed0/denominator;
+    if (position < -tolerance || position > 1. + tolerance)
+      continue;
+    const double x = x0 + position*(x1 - x0);
+    const double y = y0 + position*(y1 - y0);
+    candidate_count++;
+    if (outer_x*x + outer_y*y - outer_alpha > tolerance)
+      return false;
+  }
+  return candidate_count > 0;
 }
 
 static inline double nested_plic_direction_cosine (
@@ -197,6 +271,47 @@ static inline NestedPlicCommonNormal nested_plic_common_normal (
     common.reason = NESTED_PLIC_UNRESOLVED_NORMALS;
     return common;
   }
+  /* Equal, finite endpoint slivers carry no intermediate-material inventory
+     in this cell.  Reconcile only the narrow quality band in which both PLIC
+     cuts are geometrically present but still below resolved-neighbor quality.
+     Machine-level slivers and resolved equal-volume cuts retain the existing
+     fail-closed policy.  The caller still applies the strict face-partition
+     gate to the selected non-cancelling center direction. */
+  bool coincident_inventory = fabs(outer_fraction - inner_fraction) <=
+    64.*DBL_EPSILON;
+  bool coincident_endpoint = coincident_inventory &&
+    ((inner_fraction <= (double)NESTED_PLIC_CENTER_FRACTION_TOLERANCE &&
+      outer_fraction <= (double)NESTED_PLIC_CENTER_FRACTION_TOLERANCE) ||
+     (inner_fraction >=
+        1. - (double)NESTED_PLIC_CENTER_FRACTION_TOLERANCE &&
+      outer_fraction >=
+        1. - (double)NESTED_PLIC_CENTER_FRACTION_TOLERANCE));
+  bool finite_endpoint_sliver = coincident_endpoint &&
+    common.inner_raw_weight > (double)NESTED_PLIC_SLIVER_QUALITY_MAX &&
+    common.outer_raw_weight > (double)NESTED_PLIC_SLIVER_QUALITY_MAX &&
+    common.inner_raw_weight < (double)NESTED_PLIC_NEIGHBOR_QUALITY_MIN &&
+    common.outer_raw_weight < (double)NESTED_PLIC_NEIGHBOR_QUALITY_MIN;
+  if (finite_endpoint_sliver && common.normal_dot <= 0.) {
+    double candidate_x = common.inner_weight*inner_x +
+      common.outer_weight*outer_x;
+    double candidate_y = common.inner_weight*inner_y +
+      common.outer_weight*outer_y;
+    double candidate_norm = fabs(candidate_x) + fabs(candidate_y);
+    double required_norm = fmax(common.inner_weight, common.outer_weight);
+    if (isfinite(candidate_norm) &&
+        candidate_norm >= required_norm*(1. - 64.*DBL_EPSILON)) {
+      common.x = candidate_x/candidate_norm;
+      common.y = candidate_y/candidate_norm;
+      common.valid = 1;
+      common.used_sliver_fallback = 1;
+      common.fallback_uses_outer = -1;
+      common.fallback_support_count = 2;
+      common.fallback_quality = candidate_norm/
+        (common.inner_weight + common.outer_weight);
+      common.reason = NESTED_PLIC_COINCIDENT_INVENTORY_BLEND;
+      return common;
+    }
+  }
   if (common.normal_dot <= 0.) {
     common.reason = NESTED_PLIC_OPPOSING_NORMALS;
     return common;
@@ -264,16 +379,20 @@ nested_plic_common_normal_with_neighbors (
       (double)NESTED_PLIC_SLIVER_DOMINANCE_RATIO*weak_quality;
   bool weak_side_below_neighbor_resolution =
     weak_quality < (double)NESTED_PLIC_NEIGHBOR_QUALITY_MIN;
+  bool strong_side_dominates = strong_quality >
+    (double)NESTED_PLIC_SLIVER_DOMINANCE_RATIO*weak_quality;
   bool needs_neighbor_confirmation =
     (weak_center_is_sliver && strong_quality > weak_quality) ||
-    weak_side_below_neighbor_resolution;
-  /* A dominant center cut is insufficient when the two center normals oppose.
-     If the weak cut is below the declared resolved-neighbor quality, require
-     two resolved one-ring samples to confirm the strong-side direction. */
+    weak_side_below_neighbor_resolution || strong_side_dominates;
+  /* Opposing center cuts cannot select an orientation by local quality alone.
+     Whenever one side is resolved, require an aligned two-sample cluster from
+     the center and one-ring data. This also covers similarly resolved cuts for
+     which neither side satisfies the sliver-dominance ratio. */
   bool require_resolved_neighbor_consensus =
     common.reason == NESTED_PLIC_OPPOSING_NORMALS &&
     !both_weak_slivers && !weak_side_dominated &&
-    needs_neighbor_confirmation;
+    (needs_neighbor_confirmation ||
+     strong_quality >= (double)NESTED_PLIC_NEIGHBOR_QUALITY_MIN);
   if (!both_weak_slivers && !weak_side_dominated &&
       !require_resolved_neighbor_consensus)
     return common;
@@ -339,51 +458,100 @@ nested_plic_common_normal_with_neighbors (
   }
   int resolved_support_count = best_neighbor >= 0 ? 1 : 0;
   if (best_neighbor >= 0 && require_resolved_neighbor_consensus) {
-    double consensus_x = 0., consensus_y = 0.;
-    double consensus_weight = 0., minimum_cosine = 1.;
-    resolved_support_count = 0;
     double center_x = strong_uses_outer ? common.outer_x : common.inner_x;
     double center_y = strong_uses_outer ? common.outer_y : common.inner_y;
     double center_norm = fabs(center_x) + fabs(center_y);
-    if (strong_quality >= (double)NESTED_PLIC_NEIGHBOR_QUALITY_MIN &&
-        center_norm > 64.*DBL_EPSILON) {
+    bool center_valid =
+      strong_quality >= (double)NESTED_PLIC_NEIGHBOR_QUALITY_MIN &&
+      center_norm > 64.*DBL_EPSILON;
+    if (center_valid) {
       center_x /= center_norm;
       center_y /= center_norm;
-      double cosine = nested_plic_direction_cosine(
-        best_x, best_y, center_x, center_y);
-      if (cosine >=
-          (double)NESTED_PLIC_NEIGHBOR_CONSENSUS_COSINE_MIN) {
-        resolved_support_count++;
-        minimum_cosine = fmin(minimum_cosine, cosine);
-        consensus_x += strong_quality*center_x;
-        consensus_y += strong_quality*center_y;
-        consensus_weight += strong_quality;
+    }
+
+    /* Select the largest anchor-consistent support cluster. Anchoring the
+       consensus to the single highest-quality sample can discard a coherent
+       center-plus-neighbor pair when an isolated mixed neighbor has higher
+       fraction quality. Support count is therefore primary and total quality
+       is only the deterministic tie-breaker. */
+    int selected_count = 0, selected_neighbor = -1;
+    double selected_weight = -1.;
+    double selected_x = 0., selected_y = 0.;
+    double selected_minimum_cosine = 1.;
+    for (int anchor = -1; anchor < NESTED_PLIC_NEIGHBOR_COUNT; anchor++) {
+      if ((anchor < 0 && !center_valid) ||
+          (anchor >= 0 && !supported_valid[anchor]))
+        continue;
+      double anchor_x = anchor < 0 ? center_x : supported_x[anchor];
+      double anchor_y = anchor < 0 ? center_y : supported_y[anchor];
+      int cluster_count = 0, cluster_neighbor = -1;
+      double cluster_weight = 0., cluster_x = 0., cluster_y = 0.;
+      double cluster_minimum_cosine = 1.;
+      if (center_valid) {
+        double cosine = nested_plic_direction_cosine(
+          anchor_x, anchor_y, center_x, center_y);
+        if (cosine >=
+            (double)NESTED_PLIC_NEIGHBOR_CONSENSUS_COSINE_MIN) {
+          cluster_count++;
+          cluster_minimum_cosine = fmin(cluster_minimum_cosine, cosine);
+          cluster_x += strong_quality*center_x;
+          cluster_y += strong_quality*center_y;
+          cluster_weight += strong_quality;
+        }
+      }
+      for (int neighbor = 0; neighbor < NESTED_PLIC_NEIGHBOR_COUNT;
+           neighbor++) {
+        if (!supported_valid[neighbor])
+          continue;
+        double cosine = nested_plic_direction_cosine(
+          anchor_x, anchor_y,
+          supported_x[neighbor], supported_y[neighbor]);
+        if (cosine < (double)NESTED_PLIC_NEIGHBOR_CONSENSUS_COSINE_MIN)
+          continue;
+        cluster_count++;
+        cluster_minimum_cosine = fmin(cluster_minimum_cosine, cosine);
+        cluster_x += supported_quality[neighbor]*supported_x[neighbor];
+        cluster_y += supported_quality[neighbor]*supported_y[neighbor];
+        cluster_weight += supported_quality[neighbor];
+        if (cluster_neighbor < 0)
+          cluster_neighbor = neighbor;
+      }
+      if (cluster_count > selected_count ||
+          (cluster_count == selected_count &&
+           cluster_weight > selected_weight)) {
+        selected_count = cluster_count;
+        selected_neighbor = cluster_neighbor;
+        selected_weight = cluster_weight;
+        selected_x = cluster_x;
+        selected_y = cluster_y;
+        selected_minimum_cosine = cluster_minimum_cosine;
       }
     }
-    for (int neighbor = 0; neighbor < NESTED_PLIC_NEIGHBOR_COUNT;
-         neighbor++) {
-      if (!supported_valid[neighbor])
-        continue;
-      double cosine = nested_plic_direction_cosine(
-        best_x, best_y, supported_x[neighbor], supported_y[neighbor]);
-      if (cosine < (double)NESTED_PLIC_NEIGHBOR_CONSENSUS_COSINE_MIN)
-        continue;
-      resolved_support_count++;
-      minimum_cosine = fmin(minimum_cosine, cosine);
-      consensus_x += supported_quality[neighbor]*supported_x[neighbor];
-      consensus_y += supported_quality[neighbor]*supported_y[neighbor];
-      consensus_weight += supported_quality[neighbor];
+    resolved_support_count = selected_count;
+    if (resolved_support_count >=
+          (int)NESTED_PLIC_NEIGHBOR_CONSENSUS_COUNT_MIN &&
+        selected_neighbor >= 0 && selected_weight > 64.*DBL_EPSILON) {
+      double consensus_norm = fabs(selected_x) + fabs(selected_y);
+      if (!isfinite(consensus_norm) || consensus_norm <= 64.*DBL_EPSILON)
+        return common;
+      best_x = selected_x/consensus_norm;
+      best_y = selected_y/consensus_norm;
+      best_quality = selected_minimum_cosine;
+      best_neighbor = selected_neighbor;
+      best_uses_outer = strong_uses_outer;
     }
-    if (resolved_support_count <
-          (int)NESTED_PLIC_NEIGHBOR_CONSENSUS_COUNT_MIN ||
-        consensus_weight <= 64.*DBL_EPSILON)
-      return common;
-    double consensus_norm = fabs(consensus_x) + fabs(consensus_y);
-    if (!isfinite(consensus_norm) || consensus_norm <= 64.*DBL_EPSILON)
-      return common;
-    best_x = consensus_x/consensus_norm;
-    best_y = consensus_y/consensus_norm;
-    best_quality = minimum_cosine;
+    else {
+      /* The subordinate cut is below the declared normal-resolution floor,
+         while the other cut is resolved by the existing dominance test.
+         Preserve the resolved side using its best finite one-ring sample;
+         both reconstructed cuts still pass the caller's strict face gate. */
+      bool dominant_resolved_side =
+        weak_side_below_neighbor_resolution &&
+        strong_quality >
+          (double)NESTED_PLIC_SLIVER_DOMINANCE_RATIO*weak_quality;
+      if (!dominant_resolved_side)
+        return common;
+    }
   }
   if (best_neighbor < 0 && both_weak_slivers &&
       strong_quality <= (double)NESTED_PLIC_SLIVER_QUALITY_MAX) {
@@ -610,18 +778,70 @@ nested_plic_common_normal_with_neighbors (
       common.x = common.y = 0.;
     }
 
-    /* If no resolved one-ring or paired consensus exists, negligible
-       same-endpoint inventory still needs one transport orientation: using
-       the better-resolved center side prevents O(1) non-nested swept
-       fractions without changing either cell fraction. */
+    /* At a common endpoint, two PLIC normals within the declared endpoint
+       fraction band may be dominated by fraction noise and point in opposite
+       directions even when their weights exceed the machine-sliver band.
+       After all resolved-normal consensus paths fail, use the centered
+       gradient of the mean nested occupancy only when its one-ring signal
+       dominates the center endpoint deficit. The caller still reconstructs
+       both cuts and applies the strict face-partition gate. */
+    if ((center_low || center_high) && both_weak_slivers) {
+      double mean_fraction[NESTED_PLIC_NEIGHBOR_COUNT] = {0};
+      bool gradient_inputs_valid = true;
+      for (int neighbor = 0; neighbor < NESTED_PLIC_NEIGHBOR_COUNT;
+           neighbor++) {
+        const NestedPlicNeighbor * sample = &neighbors[neighbor];
+        gradient_inputs_valid = gradient_inputs_valid &&
+          isfinite(sample->inner_fraction) &&
+          isfinite(sample->outer_fraction) &&
+          sample->inner_fraction >= 0. &&
+          sample->outer_fraction <= 1. &&
+          sample->inner_fraction <=
+            sample->outer_fraction + 64.*DBL_EPSILON;
+        mean_fraction[neighbor] =
+          .5*(sample->inner_fraction + sample->outer_fraction);
+      }
+      double gradient_x = mean_fraction[1] - mean_fraction[0];
+      double gradient_y = mean_fraction[3] - mean_fraction[2];
+      double gradient_norm = fabs(gradient_x) + fabs(gradient_y);
+      double center_mean = .5*(inner_fraction + outer_fraction);
+      double endpoint_deficit = center_low ? center_mean : 1. - center_mean;
+      double signal_floor = fmax(64.*DBL_EPSILON,
+        (double)NESTED_PLIC_ENDPOINT_GRADIENT_DOMINANCE_RATIO*
+        endpoint_deficit);
+      if (gradient_inputs_valid && isfinite(gradient_norm) &&
+          gradient_norm > signal_floor) {
+        common.x = gradient_x/gradient_norm;
+        common.y = gradient_y/gradient_norm;
+        common.valid = 1;
+        common.used_sliver_fallback = 1;
+        common.fallback_neighbor = -1;
+        common.fallback_uses_outer = -1;
+        common.fallback_support_count = 2;
+        common.fallback_quality = gradient_norm;
+        common.reason = NESTED_PLIC_ENDPOINT_GRADIENT_FALLBACK;
+        return common;
+      }
+    }
+
+    /* If no resolved one-ring or paired consensus exists, negligible or
+       machine-level same-endpoint inventory still needs one transport
+       orientation. Use the better-resolved center side only when its PLIC
+       support dominates the other side; both cell fractions are retained and
+       the caller still applies the strict face-partition gate. */
     const double endpoint_tolerance =
       (double)NESTED_PLIC_NEGLIGIBLE_ENDPOINT_TOLERANCE;
+    bool machine_endpoint = (center_low || center_high) &&
+      both_weak_slivers &&
+      strong_quality <= (double)NESTED_PLIC_SLIVER_QUALITY_MAX;
     bool same_low_endpoint =
-      inner_fraction <= endpoint_tolerance &&
-      outer_fraction <= endpoint_tolerance;
+      center_low &&
+      ((inner_fraction <= endpoint_tolerance &&
+        outer_fraction <= endpoint_tolerance) || machine_endpoint);
     bool same_high_endpoint =
-      inner_fraction >= 1. - endpoint_tolerance &&
-      outer_fraction >= 1. - endpoint_tolerance;
+      center_high &&
+      ((inner_fraction >= 1. - endpoint_tolerance &&
+        outer_fraction >= 1. - endpoint_tolerance) || machine_endpoint);
     double endpoint_weak_quality = fmin(
       common.inner_raw_weight, common.outer_raw_weight);
     double endpoint_strong_quality = fmax(
@@ -646,6 +866,44 @@ nested_plic_common_normal_with_neighbors (
         common.outer_raw_weight : common.inner_raw_weight;
       common.reason = NESTED_PLIC_NEGLIGIBLE_ENDPOINT_FALLBACK;
       return common;
+    }
+
+    /* At a machine-level common endpoint, the PLIC normals can be mutually
+       transverse even though both cuts carry negligible interfacial support.
+       If every stronger neighborhood policy above is unavailable, retain the
+       two center directions only when their fraction-weighted resultant does
+       not cancel either input's resolved magnitude. This preserves both cell
+       inventories and leaves the strict face-partition gate unchanged; truly
+       opposing or underdetermined endpoint normals remain hard failures. */
+    bool both_center_normals_resolved =
+      common.inner_norm_l1 > 64.*DBL_EPSILON &&
+      common.outer_norm_l1 > 64.*DBL_EPSILON;
+    bool both_center_fractions_resolved =
+      common.inner_raw_weight > 64.*DBL_EPSILON &&
+      common.outer_raw_weight > 64.*DBL_EPSILON;
+    if (machine_endpoint && both_center_normals_resolved &&
+        both_center_fractions_resolved) {
+      double candidate_x = common.inner_weight*common.inner_x +
+        common.outer_weight*common.outer_x;
+      double candidate_y = common.inner_weight*common.inner_y +
+        common.outer_weight*common.outer_y;
+      double candidate_norm = fabs(candidate_x) + fabs(candidate_y);
+      double required_norm = fmax(
+        common.inner_weight, common.outer_weight);
+      if (isfinite(candidate_norm) &&
+          candidate_norm >= required_norm*(1. - 64.*DBL_EPSILON)) {
+        common.x = candidate_x/candidate_norm;
+        common.y = candidate_y/candidate_norm;
+        common.valid = 1;
+        common.used_sliver_fallback = 1;
+        common.fallback_neighbor = -1;
+        common.fallback_uses_outer = -1;
+        common.fallback_support_count = 2;
+        common.fallback_quality = candidate_norm/
+          (common.inner_weight + common.outer_weight);
+        common.reason = NESTED_PLIC_ENDPOINT_CENTER_BLEND;
+        return common;
+      }
     }
   }
   if (best_neighbor < 0)

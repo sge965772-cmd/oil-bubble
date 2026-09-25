@@ -58,6 +58,8 @@ double dual_momentum_max_rejected_face_projection_correction = 0.;
 double dual_momentum_max_rejected_face_transport_correction = 0.;
 long dual_momentum_nested_plic_fallback_count = 0;
 long dual_momentum_nested_plic_fallback_count_max = 0;
+long dual_momentum_compression_fallback_count = 0;
+long dual_momentum_compression_fallback_count_max = 0;
 static int aggregate_current_sweep_axis = -1;
 static int aggregate_current_transport_iteration = -1;
 static double aggregate_current_transport_time = -1.;
@@ -189,6 +191,44 @@ static inline void aggregate_report_invalid_cell (
   (void)stage; (void)identity;
   (void)lower_gas; (void)lower_envelope;
   (void)upper_gas; (void)upper_envelope;
+  (void)cell_x; (void)cell_y; (void)cell_delta;
+#endif
+}
+
+static inline void aggregate_report_invalid_low_order_cell (
+  const char * material, double initial, double low,
+  double left_low_flux, double right_low_flux,
+  double left_anti_flux, double right_anti_flux,
+  double step, double divergence, double scale,
+  double cell_x, double cell_y, double cell_delta)
+{
+#if AGGREGATE_MATERIAL_CELL_DIAGNOSTICS
+  FILE * stream = aggregate_face_reject_diagnostic_stream();
+  if (stream) {
+    const double left_anti_contribution = scale*left_anti_flux;
+    const double right_anti_contribution = -scale*right_anti_flux;
+    fprintf(stream,
+      "kind=low_order_cell pid=%d t=%.17g i=%d sweep_axis=%d "
+      "x=%.17g y=%.17g Delta=%.17g material=%s "
+      "initial=%.17g low=%.17g "
+      "left_low_flux=%.17g right_low_flux=%.17g "
+      "left_anti_flux=%.17g right_anti_flux=%.17g "
+      "left_anti_contribution=%.17g right_anti_contribution=%.17g "
+      "step=%.17g divergence=%.17g scale=%.17g\n",
+      pid(), aggregate_current_transport_time,
+      aggregate_current_transport_iteration, aggregate_current_sweep_axis,
+      cell_x, cell_y, cell_delta, material,
+      initial, low, left_low_flux, right_low_flux,
+      left_anti_flux, right_anti_flux,
+      left_anti_contribution, right_anti_contribution,
+      step, divergence, scale);
+    fflush(stream);
+  }
+#else
+  (void)material; (void)initial; (void)low;
+  (void)left_low_flux; (void)right_low_flux;
+  (void)left_anti_flux; (void)right_anti_flux;
+  (void)step; (void)divergence; (void)scale;
   (void)cell_x; (void)cell_y; (void)cell_delta;
 #endif
 }
@@ -481,7 +521,10 @@ static long aggregate_reconcile_nested_plic (
     bool outer_mixed = outer_fraction[] > 0. && outer_fraction[] < 1.;
     if (inner_mixed && outer_mixed &&
         nested_plic_requires_common_normal(
-          inner_fraction[], outer_fraction[])) {
+          inner_fraction[], outer_fraction[]) &&
+        !nested_plic_independent_cuts_are_nested(
+          inner_normal.x[], inner_normal.y[], inner_intercept[],
+          outer_normal.x[], outer_normal.y[], outer_intercept[])) {
       const NestedPlicNeighbor neighbors[NESTED_PLIC_NEIGHBOR_COUNT] = {
         {
           inner_fraction[-1,0], outer_fraction[-1,0],
@@ -941,10 +984,12 @@ static void aggregate_momentum_sweep_x (
   }
 
 #if AGGREGATE_MATERIAL_SIMPLEX_FLUX_LIMITING
-  long invalid_low_order_cells = 0;
-  foreach(reduction(+:invalid_low_order_cells)) {
+  long invalid_low_order_cells = 0, compression_partition_fallbacks = 0;
+  foreach(reduction(+:invalid_low_order_cells)
+          reduction(+:compression_partition_fallbacks)) {
     double divergence = uf.x[1] - uf.x[];
     double scale = dt/(cm[]*Delta + SEPS);
+    int compression_fallback_needed = 0;
 #define AGGREGATE_LOW_ORDER_BUDGET(name) do {                           \
       double low = material_##name[] + scale*(                         \
         low_##name##_flux[] - low_##name##_flux[1] +                   \
@@ -954,7 +999,7 @@ static void aggregate_momentum_sweep_x (
       double negative_anti = min(0., left_anti) + min(0., right_anti); \
       if (!isfinite(low) || low <                                      \
           -(double)POSITIVE_MATERIAL_PARTITION_TOLERANCE) {            \
-        invalid_low_order_cells++;                                    \
+        compression_fallback_needed = 1;                               \
         ratio_##name[] = 0.;                                          \
       }                                                               \
       else                                                             \
@@ -967,6 +1012,93 @@ static void aggregate_momentum_sweep_x (
     AGGREGATE_LOW_ORDER_BUDGET(upper_oil);
     AGGREGATE_LOW_ORDER_BUDGET(upper_gas);
 #undef AGGREGATE_LOW_ORDER_BUDGET
+
+    if (compression_fallback_needed) {
+      double initial[SIMPLEX_FLUX_MATERIALS] = {
+        material_water[], material_lower_oil[], material_lower_gas[],
+        material_upper_oil[], material_upper_gas[]
+      };
+      double left_low[SIMPLEX_FLUX_MATERIALS] = {
+        low_water_flux[], low_lower_oil_flux[], low_lower_gas_flux[],
+        low_upper_oil_flux[], low_upper_gas_flux[]
+      };
+      double right_low[SIMPLEX_FLUX_MATERIALS] = {
+        low_water_flux[1], low_lower_oil_flux[1], low_lower_gas_flux[1],
+        low_upper_oil_flux[1], low_upper_gas_flux[1]
+      };
+      double left_anti[SIMPLEX_FLUX_MATERIALS] = {
+        anti_water_flux[], anti_lower_oil_flux[], anti_lower_gas_flux[],
+        anti_upper_oil_flux[], anti_upper_gas_flux[]
+      };
+      double right_anti[SIMPLEX_FLUX_MATERIALS] = {
+        anti_water_flux[1], anti_lower_oil_flux[1], anti_lower_gas_flux[1],
+        anti_upper_oil_flux[1], anti_upper_gas_flux[1]
+      };
+      double requested[SIMPLEX_FLUX_MATERIALS] = {
+        step_water[], step_lower_oil[], step_lower_gas[],
+        step_upper_oil[], step_upper_gas[]
+      };
+      int fallback_material = 0;
+      for (int material = 1; material < SIMPLEX_FLUX_MATERIALS; material++)
+        if (initial[material] > initial[fallback_material])
+          fallback_material = material;
+      double fallback[SIMPLEX_FLUX_MATERIALS] = {0., 0., 0., 0., 0.};
+      fallback[fallback_material] = 1.;
+      SimplexLowOrderBudgetSet budgets = simplex_low_order_budget_set(
+        initial, left_low, right_low, left_anti, right_anti,
+        requested, fallback, divergence, scale,
+        (double)POSITIVE_MATERIAL_PARTITION_TOLERANCE);
+      if (budgets.valid && budgets.used_fallback) {
+        compression_partition_fallbacks++;
+        step_water[] = fallback[0];
+        step_lower_oil[] = fallback[1];
+        step_lower_gas[] = fallback[2];
+        step_upper_oil[] = fallback[3];
+        step_upper_gas[] = fallback[4];
+        lower_gas_step[] = fallback[2];
+        lower_envelope_step[] = fallback[1] + fallback[2];
+        upper_gas_step[] = fallback[4];
+        upper_envelope_step[] = fallback[3] + fallback[4];
+#if AGGREGATE_MATERIAL_CELL_DIAGNOSTICS
+        FILE * fallback_stream = aggregate_face_reject_diagnostic_stream();
+        if (fallback_stream) {
+          fprintf(fallback_stream,
+            "kind=compression_partition_fallback pid=%d t=%.17g i=%d "
+            "sweep_axis=%d x=%.17g y=%.17g Delta=%.17g "
+            "requested=%.17g,%.17g,%.17g,%.17g,%.17g "
+            "fallback_material=%d\n",
+            pid(), aggregate_current_transport_time,
+            aggregate_current_transport_iteration,
+            aggregate_current_sweep_axis, x, y, Delta,
+            requested[0], requested[1], requested[2], requested[3],
+            requested[4], fallback_material);
+          fflush(fallback_stream);
+        }
+#endif
+        ratio_water[] = budgets.material[0].depletion_ratio;
+        ratio_lower_oil[] = budgets.material[1].depletion_ratio;
+        ratio_lower_gas[] = budgets.material[2].depletion_ratio;
+        ratio_upper_oil[] = budgets.material[3].depletion_ratio;
+        ratio_upper_gas[] = budgets.material[4].depletion_ratio;
+      }
+      else {
+        invalid_low_order_cells++;
+        ratio_water[] = ratio_lower_oil[] = ratio_lower_gas[] = 0.;
+        ratio_upper_oil[] = ratio_upper_gas[] = 0.;
+        for (int material = 0; material < SIMPLEX_FLUX_MATERIALS;
+             material++)
+          if (!budgets.material[material].valid)
+            aggregate_report_invalid_low_order_cell(
+              material == 0 ? "water" :
+              material == 1 ? "lower_oil" :
+              material == 2 ? "lower_gas" :
+              material == 3 ? "upper_oil" : "upper_gas",
+              initial[material], budgets.material[material].value,
+              left_low[material], right_low[material],
+              left_anti[material], right_anti[material],
+              fallback[material], divergence, scale, x, y, Delta);
+      }
+    }
   }
   boundary((scalar *){
     ratio_water, ratio_lower_oil, ratio_lower_gas,
@@ -1122,6 +1254,11 @@ static void aggregate_momentum_sweep_x (
   }
   invalid_faces += invalid_limiter_faces;
   invalid_cells += invalid_low_order_cells;
+  dual_momentum_compression_fallback_count +=
+    compression_partition_fallbacks;
+  dual_momentum_compression_fallback_count_max = max(
+    dual_momentum_compression_fallback_count_max,
+    dual_momentum_compression_fallback_count);
   dual_momentum_limited_face_count += limited_faces;
   dual_momentum_limited_face_count_max = max(
     dual_momentum_limited_face_count_max,
@@ -1222,6 +1359,7 @@ event vof (i++)
   dual_momentum_max_flux_courant_correction = 0.;
   dual_momentum_face_projection_fallback_count = 0;
   dual_momentum_nested_plic_fallback_count = 0;
+  dual_momentum_compression_fallback_count = 0;
   aggregate_current_transport_time = t;
   aggregate_current_transport_iteration = i;
   for (scalar indicator in interfaces)

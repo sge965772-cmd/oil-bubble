@@ -209,11 +209,12 @@ sample_axisymmetric_water_film (
                  isfinite(interface_velocity[4*bin + 2]) &&
                  isfinite(interface_velocity[4*bin + 3]);
     AxisymmetricFilmSample * sample = &samples.bin[bin];
+    sample->lower_sample_count = lower_samples[bin];
+    sample->upper_sample_count = upper_samples[bin];
     sample->radius = (bin + .5)*radial_step;
     sample->width = radial_step;
     sample->valid = valid;
-    if (valid) {
-      sample->gap = upper[bin] - lower[bin];
+    if (both_interfaces_sampled) {
       sample->delta = max(lower_delta[bin], upper_delta[bin]);
       sample->normal_x = 1.;
       sample->normal_r = 0.;
@@ -221,6 +222,9 @@ sample_axisymmetric_water_film (
         .x = lower[bin], .r = sample->radius};
       sample->upper_point = (AxisymmetricFilmPoint){
         .x = upper[bin], .r = sample->radius};
+    }
+    if (valid) {
+      sample->gap = upper[bin] - lower[bin];
       sample->lower_velocity = (AxisymmetricFilmVelocity){
         .x = interface_velocity[4*bin],
         .r = interface_velocity[4*bin + 1]};
